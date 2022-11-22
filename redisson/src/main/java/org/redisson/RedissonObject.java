@@ -39,6 +39,7 @@ import java.util.stream.StreamSupport;
  *
  * @author Nikita Koksharov
  *
+ * RedissonObject是RedssionClient构造出来的大多数对象的基类，也是RedissonBaseLock的基类
  */
 public abstract class RedissonObject implements RObject {
 

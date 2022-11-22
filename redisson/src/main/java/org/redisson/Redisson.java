@@ -65,6 +65,7 @@ public class Redisson implements RedissonClient {
         this.config = config;
         Config configCopy = new Config(config);
 
+        //负责底层通讯，Netty
         connectionManager = ConfigSupport.createConnectionManager(configCopy);
         RedissonObjectBuilder objectBuilder = null;
         if (config.isReferenceEnabled()) {
@@ -342,6 +343,13 @@ public class Redisson implements RedissonClient {
         return new RedissonMap<K, V>(codec, commandExecutor, name, this, options, writeBehindService);
     }
 
+    /**
+     * Redisson.getLock将ConnectionManager里的CommandExecutor带进RedissonLock，
+     * 目的肯定是为了RedissonLock可以调用底层通讯方法请求redis。
+     * name对应的就是我们的要锁的对象的标识，比如订单号。
+     * @param name - name of object
+     * @return
+     */
     @Override
     public RLock getLock(String name) {
         return new RedissonLock(commandExecutor, name);

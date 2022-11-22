@@ -54,7 +54,9 @@ public class RedissonLock extends RedissonBaseLock {
     public RedissonLock(CommandAsyncExecutor commandExecutor, String name) {
         super(commandExecutor, name);
         this.commandExecutor = commandExecutor;
+        //internalLockLeaseTime：watchDog的超时时间，默认30s；
         this.internalLockLeaseTime = commandExecutor.getConnectionManager().getCfg().getLockWatchdogTimeout();
+        //用到了redis的pubsub
         this.pubSub = commandExecutor.getConnectionManager().getSubscribeService().getLockPubSub();
     }
 
@@ -143,7 +145,24 @@ public class RedissonLock extends RedissonBaseLock {
     private Long tryAcquire(long waitTime, long leaseTime, TimeUnit unit, long threadId) {
         return get(tryAcquireAsync(waitTime, leaseTime, unit, threadId));
     }
-    
+
+    /**
+     *
+     * @param waitTime 如果当前其他人获取了锁，你愿意等多少时间；
+     * @param leaseTime 如果你获取了锁，你想要多久自动释放；
+     * @param unit 针对leaseTime的单位；
+     * @param threadId 当前线程id；
+     * @return
+     *
+     *
+     * 针对无参tryLock，waitTime和leaseTime都是-1。
+     *
+     * waitTime=-1，意味着不等待，如果当前锁被其他人占用，快速返回false；
+     * leaseTime=-1，意味深长，如果是-1，代表启用自动续期watchDog，如果不是-1，代表用户自己控制锁过期时间，比如60秒。
+     *
+     * 无论leaseTime和waitTime的赋值如何，都会先调用tryLockInnerAsync。
+     * 只是针对leaseTime=-1的情况，还要在tryLockInnerAsync获取锁成功后，执行scheduleExpirationRenewal
+     */
     private RFuture<Boolean> tryAcquireOnceAsync(long waitTime, long leaseTime, TimeUnit unit, long threadId) {
         RFuture<Boolean> acquiredFuture;
         if (leaseTime > 0) {
@@ -189,11 +208,30 @@ public class RedissonLock extends RedissonBaseLock {
         return new CompletableFutureWrapper<>(f);
     }
 
+    /**
+     * 无参的tryLock底层调用tryAcquireOnceAsync返回一个Future，再通过get阻塞等待Future完成。
+     * @return
+     */
     @Override
     public boolean tryLock() {
         return get(tryLockAsync());
     }
 
+    /**
+     * tryLockInnerAsync是个核心方法，就是执行lua脚本，参数如下：
+     *
+     * KEYS[1]：我们Redisson.getLock传入的name，代表需要锁定的业务对象，比如订单号；
+     * ARGV[1]：leaseTime，锁自动释放时间，比如无参tryLock这里是internalLockLeaseTime，就是watchDog的续期时间，如果是用户传入leaseTime，那就是用户指定锁定过期时间，对于redis来说就是key的ttl；
+     * ARGV[2]：进程id拼接threadid；
+     *
+     * @param waitTime
+     * @param leaseTime
+     * @param unit
+     * @param threadId
+     * @param command
+     * @param <T>
+     * @return
+     */
     <T> RFuture<T> tryLockInnerAsync(long waitTime, long leaseTime, TimeUnit unit, long threadId, RedisStrictCommand<T> command) {
         return evalWriteAsync(getRawName(), LongCodec.INSTANCE, command,
                 "if (redis.call('exists', KEYS[1]) == 0) then " +
@@ -210,11 +248,32 @@ public class RedissonLock extends RedissonBaseLock {
                 Collections.singletonList(getRawName()), unit.toMillis(leaseTime), getLockName(threadId));
     }
 
+    /**
+     * 两个参数的tryLock方法也是实现了JDK的Lock接口，是指定waitTime，
+     * 就是如果其他人获取锁了，最多允许等待waitTime时间获取锁，否则返回false。
+     * 底层调用tryLock三个参数方法，相应的leaseTime还是-1，代表要走watchDog逻辑。
+     *
+     * 带waitTime的tryLock主要逻辑就两部分：
+     *
+     * tryAcquire竞争锁；
+     * 订阅一个channel，接收key过期消息（那就是unlock的时候，会publish一个消息），
+     * 底层通过JDK的Semaphore实现同步，
+     * 这也是RedissonLock的LockPubSub的作用，用于发布锁定key过期和接收锁定key过期；
+     *
+     * 以上逻辑都建立在不超过waitTime的基础之上。
+     *
+     * @param waitTime the maximum time to acquire the lock
+     * @param leaseTime lease time
+     * @param unit time unit
+     * @return
+     * @throws InterruptedException
+     */
     @Override
     public boolean tryLock(long waitTime, long leaseTime, TimeUnit unit) throws InterruptedException {
         long time = unit.toMillis(waitTime);
         long current = System.currentTimeMillis();
         long threadId = Thread.currentThread().getId();
+        // 1.竞争锁
         Long ttl = tryAcquire(waitTime, leaseTime, unit, threadId);
         // lock acquired
         if (ttl == null) {
@@ -228,6 +287,7 @@ public class RedissonLock extends RedissonBaseLock {
         }
         
         current = System.currentTimeMillis();
+        // 2.利用pubsub订阅一个channel,为了接收锁被unlock的消息
         CompletableFuture<RedissonLockEntry> subscribeFuture = subscribe(threadId);
         try {
             subscribeFuture.get(time, TimeUnit.MILLISECONDS);
@@ -254,6 +314,7 @@ public class RedissonLock extends RedissonBaseLock {
             }
         
             while (true) {
+                // 3.竞争锁
                 long currentTime = System.currentTimeMillis();
                 ttl = tryAcquire(waitTime, leaseTime, unit, threadId);
                 // lock acquired
@@ -267,6 +328,7 @@ public class RedissonLock extends RedissonBaseLock {
                     return false;
                 }
 
+                // 4.等待锁过期消息，重新进入3
                 // waiting for message
                 currentTime = System.currentTimeMillis();
                 if (ttl >= 0 && ttl < time) {
@@ -282,6 +344,7 @@ public class RedissonLock extends RedissonBaseLock {
                 }
             }
         } finally {
+            // 5.取消订阅
             unsubscribe(commandExecutor.getNow(subscribeFuture), threadId);
         }
 //        return get(tryLockAsync(waitTime, leaseTime, unit));
@@ -295,11 +358,28 @@ public class RedissonLock extends RedissonBaseLock {
         pubSub.unsubscribe(entry, getEntryName(), getChannelName());
     }
 
+    /**
+     * 对于tryLock api有两个重要的参数：
+     * waitTime：代表最多等待多久获取锁，如果设置为-1，获取锁失败后直接返回false；
+     * 如果设置非-1，底层会利用redis的pubsub监听解锁消息，在未超时的情况下获取锁；
+     * leaseTime：代表锁自动过期的时间，如果设置为-1，代表开启watchDog，只要业务还在进行，就会自动续期；
+     * 如果设置非-1，由leaseTime决定锁过期时间，不会开启watchDog；
+     *
+     * @param waitTime
+     * @param unit
+     * @return
+     * @throws InterruptedException
+     */
     @Override
     public boolean tryLock(long waitTime, TimeUnit unit) throws InterruptedException {
         return tryLock(waitTime, -1, unit);
     }
 
+    /**
+     * lua脚本解锁：要注意判断自己的id是否是当前获取锁成功的客户端id；要注意重入逻辑；
+     * 无论使用什么方式加锁，解锁都要publish对应key删除的消息到channel=redisson_lock__channel:{锁定业务对象，如订单号}；
+     * 取消watchDog；
+     */
     @Override
     public void unlock() {
         try {
@@ -343,16 +423,16 @@ public class RedissonLock extends RedissonBaseLock {
 
     protected RFuture<Boolean> unlockInnerAsync(long threadId) {
         return evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
-                "if (redis.call('hexists', KEYS[1], ARGV[3]) == 0) then " +
+                "if (redis.call('hexists', KEYS[1], ARGV[3]) == 0) then " +  // 判断是否是自己上的锁
                         "return nil;" +
                         "end; " +
-                        "local counter = redis.call('hincrby', KEYS[1], ARGV[3], -1); " +
-                        "if (counter > 0) then " +
-                        "redis.call('pexpire', KEYS[1], ARGV[2]); " +
+                        "local counter = redis.call('hincrby', KEYS[1], ARGV[3], -1); " + // 减少重入次数
+                        "if (counter > 0) then " +   // 如果重入次数仍然大于0
+                        "redis.call('pexpire', KEYS[1], ARGV[2]); " +  // renew续租
                         "return 0; " +
-                        "else " +
-                        "redis.call('del', KEYS[1]); " +
-                        "redis.call('publish', KEYS[2], ARGV[1]); " +
+                        "else " +    // 如果重入次数为0
+                        "redis.call('del', KEYS[1]); " +  // 删除key
+                        "redis.call('publish', KEYS[2], ARGV[1]); " +   // 发布解锁消息
                         "return 1; " +
                         "end; " +
                         "return nil;",

@@ -43,6 +43,8 @@ import java.util.concurrent.locks.Condition;
  *
  * @author Danila Varatyntsev
  * @author Nikita Koksharov
+ *
+ * RedissonBaseLock是RedissonLock的基类
  */
 public abstract class RedissonBaseLock extends RedissonExpirable implements RLock {
 
@@ -96,9 +98,13 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
     private static final Logger log = LoggerFactory.getLogger(RedissonBaseLock.class);
 
     private static final ConcurrentMap<String, ExpirationEntry> EXPIRATION_RENEWAL_MAP = new ConcurrentHashMap<>();
+    // watchDog的超时时间，默认30s；
     protected long internalLockLeaseTime;
 
+    //  ConnectionManager的id，UUID.randomUUID().toString()，
+    // 如果一个进程只有一个RedissonClient，那么可以认为这个id在进程内唯一，后续我们就称id是进程id；
     final String id;
+    // 进程id拼接业务对象标识name，比如UUID.randomUUID().toString()+":"+订单号；
     final String entryName;
 
     final CommandAsyncExecutor commandExecutor;
@@ -319,6 +325,7 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
         RFuture<Boolean> future = unlockInnerAsync(threadId);
 
         CompletionStage<Void> f = future.handle((opStatus, e) -> {
+            // 3.取消watchDog(HashTimeWheel里的那个timeout)
             cancelExpirationRenewal(threadId);
 
             if (e != null) {

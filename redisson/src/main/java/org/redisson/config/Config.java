@@ -68,6 +68,7 @@ public class Config {
 
     private EventLoopGroup eventLoopGroup;
 
+    //watchDog的超时时间，默认30s；
     private long lockWatchdogTimeout = 30 * 1000;
 
     private boolean checkLockSyncedSlaves = true;
